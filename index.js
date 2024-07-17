@@ -42,62 +42,65 @@ async function run() {
     // Allowed roles
     const allowedRoles = ["user", "agent"];
 
-    // Register User
-    app.post("/register", async (req, res) => {
-      const { name, pin, number, email, role } = req.body;
+    // Protect routes middleware
+    const authenticateToken = (req, res, next) => {
+      const token = req.header("Authorization");
+      if (!token) return res.status(401).json({ error: "Access denied" });
 
-      // Basic validation
-      if (!name || !pin || !number || !email || !role) {
-        return res.status(400).send({ error: "All fields are required" });
+      try {
+        const verified = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = verified;
+        next();
+      } catch (error) {
+        res.status(400).json({ error: "Invalid token" });
       }
+    };
 
-      // Validate role
-      if (!allowedRoles.includes(role)) {
-        return res.status(400).send({ error: "Invalid role" });
-      }
+    // Create a new user
+    app.put("/register", async (req, res) => {
+      const { name, pin, role, number, email } = req.body;
 
-      // Validate email format
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(email)) {
-        return res.status(400).send({ error: "Invalid email format" });
-      }
-
-      // Validate mobile number format (assuming a simple 11-digit number for example)
-      const mobileRegex = /^\d{11}$/;
-      if (!mobileRegex.test(number)) {
-        return res.status(400).send({ error: "Invalid mobile number format" });
-      }
-
-      // Check if user with the same email or mobile already exists
-      const existingUser = await userCollection.findOne({
-        $or: [{ email }, { number }, { role }],
-      });
+      // Check if the user already exists
+      const query = {
+        $or: [{ email: email }, { number: number }],
+      };
+      const existingUser = await userCollection.findOne(query);
       if (existingUser) {
-        return res.status(400).send({
-          error:
-            "User with the same email or mobile number and role already exists",
-        });
+        return res.status(400).json({ message: "User already exists" });
       }
-
       // Hash the PIN
-      const hashedPin = await bcrypt.hash(pin, 5);
+      const hashedPin = await bcrypt.hash(pin, 10);
 
-      // Create a new user object
-      const newUser = {
-        name,
-        pin: hashedPin,
-        number,
-        email,
-        role,
-        status: "pending",
-        balance: 0,
+      // save user for the first time
+      const options = { upsert: true };
+      const updateDoc = {
+        $set: {
+          name,
+          pin: hashedPin,
+          number,
+          email,
+          status: "Pending",
+          role,
+          balance: 0,
+          timestamp: Date.now(),
+        },
       };
 
-      // Insert the new user into the database
-      const result = await userCollection.insertOne(newUser);
-      res.status(201).send({ insertedId: result.insertedId });
+      // Save the user to the database
+      try {
+        const result = await userCollection.updateOne(
+          query,
+          updateDoc,
+          options
+        );
+        res.status(201).json({
+          message: "User registered, pending admin approval",
+          userId: result.insertedId,
+        });
+      } catch (error) {
+        res.status(500).json({ error: "Registration failed" });
+      }
     });
-
     // Login
     app.post("/login", async (req, res) => {
       const { identifier, pin } = req.body;
@@ -125,20 +128,6 @@ async function run() {
       }
     });
 
-    // Protect routes middleware
-    const authenticateToken = (req, res, next) => {
-      const token = req.header("Authorization");
-      if (!token) return res.status(401).json({ error: "Access denied" });
-
-      try {
-        const verified = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = verified;
-        next();
-      } catch (error) {
-        res.status(400).json({ error: "Invalid token" });
-      }
-    };
-
     // Profile
     app.get("/profile", authenticateToken, async (req, res) => {
       try {
@@ -156,6 +145,134 @@ async function run() {
       }
     });
 
+    app.post("/send-money", authenticateToken, async (req, res) => {
+      const { mobileNumber, amount, pin } = req.body;
+
+      // Validate amount
+      if (amount < 50) {
+        return res
+          .status(400)
+          .json({ error: "Minimum transaction amount is 50 Taka" });
+      }
+
+      try {
+        // Verify sender's PIN
+        const sender = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        const isPinValid = await bcrypt.compare(pin, sender.pin);
+        if (!isPinValid) {
+          return res.status(401).json({ error: "Invalid PIN" });
+        }
+
+        // Check sender's balance
+        let transactionFee = 0;
+        if (amount > 100) {
+          transactionFee = 5;
+        }
+        const totalAmount = amount + transactionFee;
+        if (sender.balance < totalAmount) {
+          return res.status(400).json({ error: "Insufficient balance" });
+        }
+
+        // Verify recipient exists
+        const recipient = await userCollection.findOne({
+          number: mobileNumber,
+        });
+        if (!recipient) {
+          return res.status(404).json({ error: "Mobile number not found" });
+        }
+
+        // Perform the transaction
+        const session = client.startSession();
+        session.startTransaction();
+        try {
+          await userCollection.updateOne(
+            { _id: sender._id },
+            { $inc: { balance: -totalAmount } },
+            { session }
+          );
+          await userCollection.updateOne(
+            { _id: recipient._id },
+            { $inc: { balance: amount } },
+            { session }
+          );
+          await session.commitTransaction();
+        } catch (error) {
+          await session.abortTransaction();
+          throw error;
+        } finally {
+          session.endSession();
+        }
+
+        res.status(200).json({ message: "Transaction successful" });
+      } catch (error) {
+        res.status(500).json({ error: "Transaction failed" });
+      }
+    });
+    app.post("/cash-out", authenticateToken, async (req, res) => {
+      const { agentMobile, amount, pin } = req.body;
+
+      // Validate amount
+      if (amount <= 0) {
+        return res.status(400).json({ error: "Invalid transaction amount" });
+      }
+
+      try {
+        // Verify user's PIN
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        const isPinValid = await bcrypt.compare(pin, user.pin);
+        if (!isPinValid) {
+          return res.status(401).json({ error: "Invalid PIN" });
+        }
+
+        // Calculate fee
+        const fee = amount * 0.015;
+        const totalAmount = amount + fee;
+
+        // Check user's balance
+        if (user.balance < totalAmount) {
+          return res.status(400).json({ error: "Insufficient balance" });
+        }
+
+        // Verify agent exists
+        const agent = await userCollection.findOne({
+          mobile_number: agentMobile,
+          role: "agent",
+        });
+        if (!agent) {
+          return res.status(404).json({ error: "Agent not found" });
+        }
+
+        // Perform the transaction
+        const session = client.startSession();
+        session.startTransaction();
+        try {
+          await userCollection.updateOne(
+            { _id: user._id },
+            { $inc: { balance: -totalAmount } },
+            { session }
+          );
+          await userCollection.updateOne(
+            { _id: agent._id },
+            { $inc: { balance: amount + fee } },
+            { session }
+          );
+          await session.commitTransaction();
+        } catch (error) {
+          await session.abortTransaction();
+          throw error;
+        } finally {
+          session.endSession();
+        }
+
+        res.status(200).json({ message: "Cash-out successful" });
+      } catch (error) {
+        res.status(500).json({ error: "Transaction failed" });
+      }
+    });
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
